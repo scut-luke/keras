@@ -144,6 +144,7 @@ py_library(
         "//keras/protobuf:projector_config_proto_py_pb2",
         "//keras/utils:engine_utils",
         "//keras/utils:mode_keys",
+        "//third_party/tensorflow/python/distribute/failure_handling:failure_handling_lib",
     ],
 )
 
@@ -288,6 +289,8 @@ tf_py_test(
         "//:expect_numpy_installed",
         "//:expect_tensorflow_installed",
         "//keras/testing_infra:test_combinations",
+        "//third_party/tensorflow/python/distribute:multi_process_runner",
+        "//third_party/tensorflow/python/distribute:multi_worker_test_base",
     ],
 )
 

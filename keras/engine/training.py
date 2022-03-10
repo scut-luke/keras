@@ -1397,6 +1397,7 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
         self.reset_metrics()
         callbacks.on_epoch_begin(epoch)
         with data_handler.catch_stop_iteration():
+          data_handler._initial_step = self._maybe_load_initial_step_from_ckpt()  # pylint: disable=protected-access
           for step in data_handler.steps():
             with tf.profiler.experimental.Trace(
                 'train',
@@ -3141,7 +3142,18 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
     if self._training_state is not None:
       return self._training_state.maybe_load_initial_epoch_from_ckpt(
           initial_epoch, mode=ModeKeys.TRAIN)
+    if getattr(self, '_fh_finished_epoch', 0) > 0:
+      # The last checkpoint was made before finishing epoch
+      # self._fh_finished_epoch + 1. We return and train from here.
+      return self._fh_finished_epoch.numpy() + 1
+
     return initial_epoch
+
+  def _maybe_load_initial_step_from_ckpt(self):
+    if getattr(self, '_fh_finished_step', 0) > 0:
+      return self._fh_finished_step.numpy() + 1
+
+    return 0
 
   def _assert_compile_was_called(self):
     # Checks whether `compile` has been called. If it has been called,

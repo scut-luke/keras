@@ -19,8 +19,10 @@ import collections
 import csv
 import json
 import os
+import random
 import re
 import shutil
+import signal
 import sys
 import threading
 import time
@@ -31,6 +33,7 @@ from absl.testing import parameterized
 import keras
 from keras.callbacks import BackupAndRestore
 from keras.callbacks import BackupAndRestoreExperimental
+from keras.callbacks import InterruptionCheckpointCallback
 from keras.engine import sequential
 from keras.layers import Activation
 from keras.layers import Dense
@@ -42,7 +45,12 @@ from keras.utils import io_utils
 from keras.utils import np_utils
 import numpy as np
 import tensorflow.compat.v2 as tf
+
+# pylint: disable=g-direct-tensorflow-import
+from tensorflow.python.distribute import multi_process_runner
+from tensorflow.python.distribute.failure_handling import gce_util
 from tensorflow.python.platform import tf_logging as logging
+# pylint: enable=g-direct-tensorflow-import
 
 try:
   import h5py  # pylint:disable=g-import-not-at-top
@@ -425,6 +433,151 @@ class KerasCallbacksTest(test_combinations.TestCase):
     self.assertNotIn(warning_msg, '\n'.join(warning_messages))
     warning_msg = ('***Handling interruption***')
     self.assertIn(warning_msg, '\n'.join(warning_messages))
+
+  def test_interruption_checkpoint_callback_error_propogation(self):
+    has_chief = False
+    cluster_size = 4
+    cluster_spec = (
+        tf.__internal__.distribute.multi_process_runner.create_cluster_spec(
+            has_chief=has_chief, num_workers=cluster_size))
+
+    checkpoint_dir = os.path.join(self.get_temp_dir(), 'fh_ckpt')
+
+    if len(sys.argv) >= 1 and 'bazel' in sys.argv[0]:
+      rpc_layer = 'grpc'
+    else:
+      rpc_layer = 'grpc+loas'
+
+    error_worker = random.randint(0, cluster_size)
+
+    def assert_raise_error():
+      # Asserts that an error raised during a training step on one of the worker
+      # is caught on all workers.
+      with self.assertRaises(tf.errors.ResourceExhaustedError) as error:
+        self.worker_fn(checkpoint_dir, raise_app_error_on_worker=error_worker)
+      self.assertIn('Running out of resources', str(error.exception))
+
+    mpr = multi_process_runner.MultiProcessRunner(
+        assert_raise_error,
+        cluster_spec,
+        rpc_layer=rpc_layer,
+        return_output=True,
+        dependence_on_chief=False)
+
+    logging.info('Cluster starting.')
+    mpr.start()
+    mpr.join()
+
+  def test_interruption_checkpoint_callback_two_sigterm(self):
+    has_chief = False
+    cluster_size = 4
+    cluster_spec = (
+        tf.__internal__.distribute.multi_process_runner.create_cluster_spec(
+            has_chief=has_chief, num_workers=cluster_size))
+    interruption_events = [
+        multi_process_runner.manager().Event(),
+        multi_process_runner.manager().Event()
+    ]
+
+    checkpoint_dir = os.path.join(self.get_temp_dir(), 'fh_ckpt')
+
+    if len(sys.argv) >= 1 and 'bazel' in sys.argv[0]:
+      rpc_layer = 'grpc'
+    else:
+      rpc_layer = 'grpc+loas'
+
+    mpr = multi_process_runner.MultiProcessRunner(
+        self.worker_fn,
+        cluster_spec,
+        args=(checkpoint_dir, interruption_events),
+        rpc_layer=rpc_layer,
+        return_output=True,
+        dependence_on_chief=has_chief)
+
+    logging.info('Cluster starting.')
+    mpr.start()
+
+    while not interruption_events[0].is_set():
+      time.sleep(1)
+
+    logging.info('Sending first sigterm')
+    killed_worker = random.randrange(0, cluster_size)
+    os.kill(mpr.get_process_id('worker', killed_worker), signal.SIGTERM)
+
+    logging.info('First sigterm sent')
+    time.sleep(5)
+
+    logging.info('Restarting workers')
+    for worker_id in range(cluster_size):
+      mpr.start_single_process('worker', worker_id, cluster_spec)
+    logging.info('Workers restarted')
+
+    while not interruption_events[1].is_set():
+      time.sleep(1)
+
+    logging.info('Sending second sigterm')
+    killed_worker = random.randrange(0, cluster_size)
+    os.kill(mpr.get_process_id('worker', killed_worker), signal.SIGTERM)
+
+    logging.info('Second sigterm sent')
+    time.sleep(5)
+
+    logging.info('Restarting workers')
+    for worker_id in range(cluster_size):
+      mpr.start_single_process('worker', worker_id, cluster_spec)
+    logging.info('Workers restarted')
+
+    stdout = mpr.join().stdout
+    all_epochs = []
+    for msg in stdout:
+      matched_group = re.search(r'.*Epoch (\d+)/50 just finished', msg)
+
+      if matched_group:
+        all_epochs.append(int(matched_group.group(1)))
+
+    # remove duplicate logs created due to presence of multiple workers
+    all_epochs = all_epochs[::cluster_size]
+
+    # assert that after restarting, we don't repeat previous training steps
+    self.assertAllClose(range(1, 51), all_epochs)
+
+  def worker_fn(self,
+                checkpoint_dir,
+                interruption_events=None,
+                raise_app_error_on_worker=None):
+
+    class TriggerSigtermCallback(keras.callbacks.Callback):
+      """A callback to intentionally introduce interruption to training."""
+
+      def on_epoch_end(self, epoch, log=None):
+        io_utils.print_msg(f'Epoch {epoch + 1}/50 just finished.')
+
+        if raise_app_error_on_worker:
+          if (self.model.distribute_strategy.cluster_resolver.task_id ==
+              raise_app_error_on_worker):
+            raise (tf.errors.ResourceExhaustedError(
+                node_def=None, op=None, message='Running out of resources'))
+
+        else:
+          clear_event = [
+              event for event in interruption_events if not event.is_set()
+          ]
+          terminating_epoch = [5, 30, None][2 - len(clear_event)]
+          if terminating_epoch == epoch:
+            clear_event[0].set()
+
+    strategy = tf.distribute.MultiWorkerMirroredStrategy()
+    with strategy.scope():
+      model = keras.Sequential([keras.layers.Dense(1)])
+      model.compile('sgd', 'mse')
+      cbk = InterruptionCheckpointCallback(checkpoint_dir)
+
+    with mock.patch.object(gce_util, 'on_gcp', lambda: False):
+      model.fit(
+          np.ones((1000, 1)),
+          np.ones((1000, 1)),
+          epochs=50,
+          callbacks=[cbk, TriggerSigtermCallback()])
 
   @test_combinations.run_all_keras_modes
   def test_callback_warning(self):
@@ -3279,4 +3432,4 @@ def events_from_logdir(logdir):
 
 
 if __name__ == '__main__':
-  tf.test.main()
+  tf.__internal__.distribute.multi_process_runner.test_main()

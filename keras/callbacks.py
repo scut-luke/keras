@@ -25,7 +25,6 @@ import re
 import sys
 import time
 
-
 from keras import backend
 from keras.distribute import distributed_file_utils
 from keras.distribute import worker_training_state
@@ -40,10 +39,14 @@ from keras.utils.mode_keys import ModeKeys
 import numpy as np
 import tensorflow.compat.v2 as tf
 
+# pylint: disable=g-direct-tensorflow-import
+from tensorflow.python.distribute.failure_handling import failure_handling
 from tensorflow.python.platform import tf_logging as logging
-from tensorflow.python.util import deprecation  # pylint: disable=g-direct-tensorflow-import
+from tensorflow.python.training.tracking import util as trackable_util
+from tensorflow.python.util import deprecation
 from tensorflow.python.util.tf_export import keras_export
 from tensorflow.tools.docs import doc_controls
+# pylint: enable=g-direct-tensorflow-import
 
 try:
   import requests
@@ -1597,6 +1600,111 @@ class ModelCheckpoint(Callback):
       # If there are more than one file having latest modified time, return
       # the file path with the largest file name.
       return file_path_with_largest_file_name
+
+
+class InterruptionCheckpointCallback(Callback):
+  """Callback to restore and save checkpoint for worker preemption/maintenance.
+
+  Supported usage: with `tf.distribute.MultiWorkerMirroredStrategy` on Google's
+  Borg and GCP only, for now.
+
+  This callback can be used with `model.fit` to capture a preemption signal or
+  a maintenance notice, saves a checkpoint, and exit the program with a code the
+  platform recognized as automatic restart signal*, without raising error. After
+  training is restarted, the callback help model pick up where it was right
+  before the interruption, including the tracked epoch and step number. Plus, it
+  will also help propagate any application error message during the training to
+  all workers.
+
+  *This is now only configured for Borg and GCP. Later we will add an argument
+  to allow customization to different platforms.
+
+  Basic usage:
+  ```python
+  strategy = tf.distribute.MultiWorkerMirroredStrategy()
+  with strategy.scope():
+    model = define_model()
+    interruption_callback = InterruptionCheckpointCallback(temp_ckpt_dir)
+    ...
+
+  model.fit(..., callbacks=[interruption_callback], epoch=50, ...)
+  ```
+
+  In this case, even if the training were interrupted in the middle, there will
+  be a total of 50 epochs trained without repetition.
+
+  Args:
+      checkpoint_dir: String, path to store the checkpoint. This is the
+        directory in which the system stores temporary files to recover the
+        model from jobs terminated unexpectedly. The directory has to be
+        uniquely used by the InterruptionCheckpointCallback and cannot be reused
+        elsewhere to store other files, e.g. by BackupAndRestore callback,
+        ModelCheckpoint, etc.
+      checkpoint: Optional `tf.train.Checkpoint` object to be passed if user
+        would like to customize what is saved and restored upon interruption. By
+        default, a checkpoint containing only the model will be saved.
+  """
+
+  def __init__(self, checkpoint_dir, checkpoint=None):
+    super(InterruptionCheckpointCallback, self).__init__()
+    self._checkpoint = checkpoint
+    self._checkpoint_dir = checkpoint_dir
+
+    self._supports_tf_logs = True
+    self._supported_strategies = (tf.distribute.MultiWorkerMirroredStrategy)
+    if not tf.executing_eagerly():
+      if tf.inside_function():
+        raise ValueError('This Callback\'s method contains Python state and '
+                         'should be called outside of `tf.function`s.')
+      else:  # Legacy graph mode:
+        raise ValueError(
+            'BackupAndRestore only supports eager mode. In graph '
+            'mode, consider using ModelCheckpoint to manually save '
+            'and restore weights with `model.load_weights()` and by '
+            'providing `initial_epoch` in `model.fit()` for fault tolerance.')
+
+    # Only the chief worker writes model checkpoints, but all workers
+    # restore checkpoint at on_train_begin().
+    self._chief_worker_only = False
+
+  def on_train_begin(self, logs=None):
+    if not isinstance(
+        getattr(self.model, 'distribute_strategy', None),
+        self._supported_strategies):
+      raise NotImplementedError(
+          f'{type(self.model.distribute_strategy)} is not supported yet. '
+          'Currently InterruptionCheckpointCallback only supports '
+          'MultiWorkerMirroredStrategy.')
+
+    if not self._checkpoint:
+      self._checkpoint = trackable_util.Checkpoint(model=self.model)
+
+    # pylint: disable=protected-access
+    if not hasattr(self.model, '_fh_finished_epoch'):
+      self.model._fh_finished_epoch = tf.Variable(
+          initial_value=tf.constant(-1, dtype=tf.int64), trainable=False,
+          name='fh_finished_epoch')
+      self.model._fh_finished_step = tf.Variable(
+          initial_value=tf.constant(-1, dtype=tf.int64), trainable=False,
+          name='fh_finished_step')
+
+    self._checkpoint.fh_finished_epoch = self.model._fh_finished_epoch
+    self._checkpoint.fh_finished_step = self.model._fh_finished_step
+    self._checkpoint.fh_train_counter = self.model._train_counter
+    cluster_resolver = self.model.distribute_strategy.extended._cluster_resolver
+    # pylint: enable=protected-access
+
+    self._failure_handler = failure_handling.CoordinatedCheckpointManager(
+        cluster_resolver, self._checkpoint, self._checkpoint_dir)
+
+  def on_batch_end(self, batch, logs=None):
+    self._checkpoint.fh_finished_step.assign_add(1)
+    self._failure_handler._run_counter += 1
+    self._failure_handler._checkpoint_if_preempted()  # pylint: disable=protected-access
+
+  def on_epoch_end(self, epoch, logs=None):
+    self._checkpoint.fh_finished_epoch.assign_add(1)  # pylint: disable=protected-access
+    self._checkpoint.fh_finished_step.assign(-1)  # pylint: disable=protected-access
 
 
 @keras_export('keras.callbacks.BackupAndRestore', v1=[])

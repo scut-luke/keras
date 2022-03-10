@@ -114,6 +114,7 @@ py_library(
     srcs_version = "PY3",
     deps = [
         "//:expect_tensorflow_installed",
+        "//third_party/tensorflow/python/eager:context",
     ],
 )
 

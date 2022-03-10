@@ -21,6 +21,7 @@ import traceback
 import types
 import tensorflow.compat.v2 as tf
 
+from tensorflow.python.eager import context  # pylint: disable=g-direct-tensorflow-import
 
 _EXCLUDED_PATHS = (
     os.path.abspath(os.path.join(__file__, '..', '..')),
@@ -63,6 +64,14 @@ def filter_traceback(fn):
     try:
       return fn(*args, **kwargs)
     except Exception as e:  # pylint: disable=broad-except
+      if context.context().coordination_service is not None:
+        try:
+          context.context().report_error_to_cluster(e.error_code, e.message)
+
+        except Exception as ex:  # pylint: disable=broad-except
+          tf.compat.v1.logging.info(
+              'Ignoring error during error propagation: %r:%s', ex, ex)
+        raise
       filtered_tb = _process_traceback_frames(e.__traceback__)
       raise e.with_traceback(filtered_tb) from None
     finally:
